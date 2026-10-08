@@ -5,8 +5,10 @@ import { Price } from './Price'
 import { ProductBadges } from './ProductBadges'
 import { WishlistButton } from './WishlistButton'
 
-export function ProductCard({ product }) {
-  const ref = imageRef(product)
+/** `preferredColours`: colour names to show first (e.g. the active colour filter). */
+export function ProductCard({ product, preferredColours = [] }) {
+  const colour = product.colours.find((c) => preferredColours.includes(c.name))
+  const ref = imageRef(product, colour)
   const front = getProductImage(ref, 'front')
   const back = getProductImage(ref, 'back')
 
@@ -38,7 +40,7 @@ export function ProductCard({ product }) {
       <div className="relative flex flex-1 flex-col gap-1 px-2.5 pt-2.5 pb-5 before:absolute before:top-0 before:left-0 before:h-0.5 before:w-10 before:bg-ink sm:px-3 sm:pb-6 md:before:hidden">
         <h3 className="text-2xs leading-snug uppercase sm:text-xs">
           <Link
-            to={productPath(product)}
+            to={productPath(product, colour)}
             className="after:absolute after:inset-0 after:z-10 focus-visible:outline-none focus-visible:after:outline-2 focus-visible:after:-outline-offset-2 focus-visible:after:outline-ink"
           >
             {product.name}

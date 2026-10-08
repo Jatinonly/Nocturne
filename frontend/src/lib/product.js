@@ -15,6 +15,10 @@ export function imageRef(product, colour) {
   }
 }
 
-export function productPath(product) {
-  return `/product/${product.slug}`
+/** Adds `?colour=` when a non-default colour should be preselected on the detail page. */
+export function productPath(product, colour) {
+  const path = `/product/${product.slug}`
+  return colour && colour.name !== product.colours[0]?.name
+    ? `${path}?colour=${encodeURIComponent(colour.name)}`
+    : path
 }

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams, useSearchParams } from 'react-router-dom'
 import { Breadcrumbs } from '@/components/layout/Breadcrumbs'
 import { ProductCarousel } from '@/components/product/ProductCarousel'
 import { ProductGallery } from '@/components/product/ProductGallery'
@@ -33,7 +33,10 @@ function ProductDetailSkeleton() {
 }
 
 function ProductView({ product }) {
-  const [colour, setColour] = useState(product.colours[0])
+  const [searchParams] = useSearchParams()
+  const [colour, setColour] = useState(
+    () => product.colours.find((c) => c.name === searchParams.get('colour')) ?? product.colours[0],
+  )
   const images = getProductImages(imageRef(product, colour))
   const category = CATEGORIES[product.category]
   const { data: related } = useQuery(`related:${product.id}`, () =>

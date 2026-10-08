@@ -151,7 +151,11 @@ export default function ProductListingPage() {
             />
           ) : (
             <div className={cn('transition-opacity', loading && 'opacity-50')} aria-busy={loading}>
-              <ProductGrid products={data.items} columns="withSidebar" />
+              <ProductGrid
+                products={data.items}
+                columns="withSidebar"
+                preferredColours={filters.colours}
+              />
             </div>
           )}
         </div>
