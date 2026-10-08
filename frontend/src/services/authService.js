@@ -1,7 +1,7 @@
 /**
  * Authentication.
  *
- * API mode (VITE_API_BASE_URL set) — backend/src/routes/auth.js, bcrypt + JWT in Postgres:
+ * API mode (VITE_API_BASE_URL set) — backend/src/routes/auth.js, bcrypt + JWT in MongoDB:
  *   login  → POST /auth/login   { email, password } → { user, token }
  *   signup → POST /auth/signup  { name, email, password } → { user, token }
  *   logout → POST /auth/logout

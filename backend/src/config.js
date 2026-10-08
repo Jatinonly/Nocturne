@@ -1,11 +1,11 @@
 /** Reads and validates environment variables once at startup. */
 /* So instead of doing this everywhere:
-    process.env.DATABASE_URL
+    process.env.MONGODB_URI
     process.env.JWT_SECRET
     process.env.PORT
 
   your application can do:
-    config.db.url
+    config.db.uri
     config.jwt.secret
     config.port
 */
@@ -15,10 +15,7 @@ import { HttpError } from './lib/httpError.js'
 function required(name) {
   const value = process.env[name]
   if (!value) {
-    throw new HttpError(
-      503,
-      `Missing env var ${name}.`,
-    )
+    throw new HttpError(503, `Missing env var ${name}.`)
   }
   return value
 }
@@ -30,10 +27,9 @@ export const config = {
     .map((origin) => origin.trim())
     .filter(Boolean),
   db: {
-    get url() {
-      return required('DATABASE_URL')
+    get uri() {
+      return required('MONGODB_URI')
     },
-    ssl: process.env.DATABASE_SSL ?? 'require',
   },
   jwt: {
     get secret() {

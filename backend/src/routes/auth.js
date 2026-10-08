@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs'
 import { Router } from 'express'
-import { query } from '../db/pool.js'
+import { User } from '../models/index.js'
 import { HttpError } from '../lib/httpError.js'
 import * as v from '../lib/validate.js'
 import { requireAuth, signToken } from '../middleware/auth.js'
@@ -12,17 +12,17 @@ const BCRYPT_ROUNDS = 12
 // bcrypt.hashSync() is the synchronous version of bcrypt.hash() because the code needs the hash immediately so it can store it in DUMMY_HASH
 const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', BCRYPT_ROUNDS)
 
-function toUser(row) {
+function toUser(doc) {
   return {
-    id: row.id,
-    name: row.name,
-    email: row.email,
-    ...(row.phone ? { phone: row.phone } : {}),
-    createdAt: row.created_at.toISOString(),
+    id: doc._id.toString(),
+    name: doc.name,
+    email: doc.email,
+    ...(doc.phone ? { phone: doc.phone } : {}),
+    createdAt: doc.createdAt.toISOString(),
   }
 }
 
-const toSession = (row) => ({ user: toUser(row), token: signToken(row.id) })
+const toSession = (doc) => ({ user: toUser(doc), token: signToken(doc._id.toString()) })
 
 /** POST /api/auth/signup { name, email, password } → { user, token } */
 authRouter.post('/signup', async (req, res) => {
@@ -32,14 +32,10 @@ authRouter.post('/signup', async (req, res) => {
 
   const hash = await bcrypt.hash(password, BCRYPT_ROUNDS)
   try {
-    const { rows } = await query(
-      'INSERT INTO users (name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, name, email, phone, created_at',
-      [name, email, hash],
-    )
-    res.status(201).json(toSession(rows[0]))
+    const user = await User.create({ name, email, passwordHash: hash })
+    res.status(201).json(toSession(user))
   } catch (error) {
-    if (error.code === '23505')
-      throw new HttpError(409, 'An account with this email already exists')
+    if (error.code === 11000) throw new HttpError(409, 'An account with this email already exists')
     throw error
   }
 })
@@ -49,24 +45,18 @@ authRouter.post('/login', async (req, res) => {
   const email = v.email(req.body?.email)
   const password = typeof req.body?.password === 'string' ? req.body.password : ''
 
-  const { rows } = await query(
-    'SELECT id, name, email, phone, created_at, password_hash FROM users WHERE lower(email) = lower($1)',
-    [email],
-  )
-  const row = rows[0]
-  const valid = await bcrypt.compare(password, row?.password_hash ?? DUMMY_HASH)
-  if (!row || !valid) throw new HttpError(401, 'Incorrect email or password')
-  res.json(toSession(row))
+  // v.email() already lower-cases, matching how emails are stored.
+  const user = await User.findOne({ email }).lean()
+  const valid = await bcrypt.compare(password, user?.passwordHash ?? DUMMY_HASH)
+  if (!user || !valid) throw new HttpError(401, 'Incorrect email or password')
+  res.json(toSession(user))
 })
 
 /** GET /api/auth/me → { user } */
 authRouter.get('/me', requireAuth, async (req, res) => {
-  const { rows } = await query(
-    'SELECT id, name, email, phone, created_at FROM users WHERE id = $1',
-    [req.userId],
-  )
-  if (!rows[0]) throw new HttpError(401, 'Your session has expired. Please log in again.')
-  res.json({ user: toUser(rows[0]) })
+  const user = await User.findById(req.userId).lean()
+  if (!user) throw new HttpError(401, 'Your session has expired. Please log in again.')
+  res.json({ user: toUser(user) })
 })
 
 /** POST /api/auth/logout — extra route for cookie */

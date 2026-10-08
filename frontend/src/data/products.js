@@ -1,6 +1,6 @@
 /**
  * Mock catalogue. Only `services/productService.js` should import this file —
- * once the backend exists this data lives in Postgres/Supabase instead.
+ * once the backend exists this data lives in MongoDB instead.
  */
 
 const COLOURS = {

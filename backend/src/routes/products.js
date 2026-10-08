@@ -1,124 +1,91 @@
 /**
- * Product catalogue. Every query is a module-level constant (BASE_FILTER is shared text,
- * spliced in once at load time). Optional filters are passed as parameters and switched
- * off with NULL (`$n IS NULL OR …`), so user input never touches the SQL text.
+ * Product catalogue. Filters are built as MongoDB query objects; user input only ever
+ * appears as values (search words are regex-escaped), never as operators.
  */
 import { Router } from 'express'
-import { query } from '../db/pool.js'
 import { HttpError } from '../lib/httpError.js'
 import * as v from '../lib/validate.js'
+import { CATEGORIES, Product } from '../models/Product.js'
 
 export const productsRouter = Router()
 
-const CATEGORIES = ['women', 'men', 'bags', 'shoes', 'jewellery']
 const COLLECTIONS = [...CATEGORIES, 'new', 'sale', 'all']
 const SORTS = ['featured', 'newest', 'price-asc', 'price-desc', 'rating']
+const SEARCH_FIELDS = ['name', 'category', 'subcategory', 'description']
 
-/** Row → the `Product` shape the frontend uses (see frontend/src/services/productService.js). */
-function toProduct(row) {
+/** Document → the `Product` shape the frontend uses (see frontend/src/services/productService.js). */
+function toProduct(doc) {
   return {
-    id: row.id,
-    slug: row.slug,
-    name: row.name,
-    description: row.description,
-    category: row.category,
-    subcategory: row.subcategory,
-    price: row.price,
+    id: doc._id,
+    slug: doc.slug,
+    name: doc.name,
+    description: doc.description,
+    category: doc.category,
+    subcategory: doc.subcategory,
+    price: doc.price,
     // The frontend checks `compareAtPrice !== undefined`, so omit it rather than sending null.
-    ...(row.compare_at_price !== null ? { compareAtPrice: row.compare_at_price } : {}),
-    colours: row.colours,
-    sizes: row.sizes,
-    stock: row.stock,
-    rating: row.rating,
-    reviewCount: row.review_count,
-    tags: row.tags,
-    silhouette: row.silhouette,
-    composition: row.composition,
-    details: row.details,
-    createdAt: row.created_at.toISOString(),
+    ...(doc.compareAtPrice != null ? { compareAtPrice: doc.compareAtPrice } : {}),
+    colours: doc.colours,
+    sizes: doc.sizes,
+    stock: doc.stock,
+    rating: doc.rating,
+    reviewCount: doc.reviewCount,
+    tags: doc.tags,
+    silhouette: doc.silhouette,
+    composition: doc.composition,
+    details: doc.details,
+    createdAt: doc.createdAt.toISOString(),
   }
 }
 
-// Shared WHERE clause for the collection + search "base set".
-// $1 collection   $2 search words (text[], LIKE-escaped)
-// The :: is PostgreSQL's type-casting syntax.
-// BaseFilter ==> (collection conditions) AND (Search condition)
-// collections can be new, sale, men, women,....
-const BASE_FILTER = `
-  (
-    $1::text = 'all'
-    OR ($1::text = 'new' AND 'new' = ANY (tags))
-    OR ($1::text = 'sale' AND compare_at_price IS NOT NULL)
-    OR category = $1::text
-  )
-  AND NOT EXISTS (
-    SELECT 1 FROM unnest($2::text[]) AS word
-    WHERE lower(name || ' ' || category || ' ' || subcategory || ' ' || description)
-      NOT LIKE '%' || word || '%'
-  )`
+/**
+ * The collection + search "base set" shared by the list, facets and search queries.
+ * collections can be new, sale, men, women, ...; every search word must appear in one of SEARCH_FIELDS.
+ */
+function baseFilter(collection, words) {
+  const filter = {}
+  if (collection === 'new') filter.tags = 'new'
+  else if (collection === 'sale') filter.compareAtPrice = { $ne: null }
+  else if (collection !== 'all') filter.category = collection
+  if (words.length) {
+    filter.$and = words.map((word) => ({
+      $or: SEARCH_FIELDS.map((field) => ({ [field]: { $regex: word, $options: 'i' } })),
+    }))
+  }
+  return filter
+}
 
-// Facets are filters that help users narrow down products.
-const FACETS_SQL = `
-  SELECT sizes, colours, subcategory, price FROM products
-  WHERE ${BASE_FILTER}
-  ORDER BY id`
+/** True when some size in `stock` (optionally only those in `sizes`) has a count above 0. */
+function hasStockExpr(sizes) {
+  const inStock = { $gt: ['$$s.v', 0] }
+  return {
+    $anyElementTrue: {
+      $map: {
+        input: { $objectToArray: '$stock' },
+        as: 's',
+        in: sizes ? { $and: [{ $in: ['$$s.k', sizes] }, inStock] } : inStock,
+      },
+    },
+  }
+}
 
-// $3 subcategory  $4 minPrice  $5 maxPrice  $6 inStockOnly  
-// $7 sizes  $8 colours  $9 sort  $10 limit
-// LIST_SQL = "Give me the actual product list the user wants to see"
-const LIST_SQL = `
-  SELECT * FROM products
-  WHERE ${BASE_FILTER}
-    AND ($3::text IS NULL OR subcategory = $3)
-    AND ($4::int IS NULL OR price >= $4)
-    AND ($5::int IS NULL OR price <= $5)
-    AND (NOT $6::boolean OR EXISTS (
-      SELECT 1 FROM jsonb_each_text(stock) AS s WHERE s.value::int > 0))
-    AND ($7::text[] IS NULL OR EXISTS (
-      SELECT 1 FROM jsonb_each_text(stock) AS s WHERE s.key = ANY ($7) AND s.value::int > 0))
-    AND ($8::text[] IS NULL OR EXISTS (
-      SELECT 1 FROM jsonb_array_elements(colours) AS c WHERE c ->> 'name' = ANY ($8)))
-  ORDER BY
-    CASE 
-      WHEN $9::text = 'featured' THEN 'bestseller' = ANY (tags)
-    END DESC,
-    CASE WHEN $9::text = 'price-asc' THEN price END ASC,
-    CASE WHEN $9::text = 'price-desc' THEN price END DESC,
-    CASE WHEN $9::text = 'rating' THEN rating END DESC,
-    created_at DESC,
-    id
-  LIMIT $10`
+// Every sort ends with newest first, then id, so the order is stable.
+const SORT_STAGES = {
+  featured: { isBestseller: -1, createdAt: -1, _id: 1 },
+  newest: { createdAt: -1, _id: 1 },
+  'price-asc': { price: 1, createdAt: -1, _id: 1 },
+  'price-desc': { price: -1, createdAt: -1, _id: 1 },
+  rating: { rating: -1, createdAt: -1, _id: 1 },
+}
 
-const SEARCH_SQL = `SELECT * FROM products WHERE ${BASE_FILTER} ORDER BY id LIMIT $3`
-
-const BY_IDS_SQL = `
-  SELECT * FROM products WHERE id = ANY ($1::text[])
-  ORDER BY array_position($1::text[], id)`
-
-const RELATED_SQL = `
-  SELECT p.* FROM products AS p
-  JOIN products AS target ON target.id = $1
-  WHERE p.id <> target.id
-  ORDER BY
-    (p.category = target.category)::int * 2
-      + (p.subcategory = target.subcategory)::int * 3
-      + (EXISTS (
-          SELECT 1 FROM jsonb_array_elements(p.colours) AS a
-          JOIN jsonb_array_elements(target.colours) AS b ON a ->> 'name' = b ->> 'name'
-        ))::int DESC,
-    p.rating DESC,
-    p.id
-  LIMIT $2`
-
-/** "red  dress" → ['red', 'dress'], lower-cased and with LIKE wildcards escaped. */
+/** "red  dress" → ['red', 'dress'], with regex special characters escaped. */
 function searchWords(term) {
   if (typeof term !== 'string') return []
   return term
-    .toLowerCase()
     .split(/\s+/)
     .filter(Boolean)
     .slice(0, 10)
-    .map((word) => word.replace(/[\\%_]/g, (char) => `\\${char}`))
+    .map((word) => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
 }
 
 /** "a,b" → ['a', 'b']; empty → null (filter off). */
@@ -134,16 +101,16 @@ function list(value) {
 const optionalInt = (value, label, opts) =>
   value === undefined || value === '' ? null : v.int(value, label, opts)
 
-function buildFacets(rows) {
+function buildFacets(docs) {
   const sizes = new Set()
   const colours = new Map()
   const subcategories = new Set()
-  for (const row of rows) {
-    row.sizes.forEach((size) => sizes.add(size))
-    row.colours.forEach((colour) => colours.set(colour.name, colour))
-    subcategories.add(row.subcategory)
+  for (const doc of docs) {
+    doc.sizes.forEach((size) => sizes.add(size))
+    doc.colours.forEach((colour) => colours.set(colour.name, colour))
+    subcategories.add(doc.subcategory)
   }
-  const prices = rows.map((row) => row.price)
+  const prices = docs.map((doc) => doc.price)
   return {
     sizes: [...sizes],
     colours: [...colours.values()],
@@ -161,8 +128,10 @@ function buildFacets(rows) {
 productsRouter.get('/', async (req, res) => {
   const ids = list(req.query.ids)
   if (ids) {
-    const { rows } = await query(BY_IDS_SQL, [ids.slice(0, 100)])
-    return res.json(rows.map(toProduct))
+    const wanted = [...new Set(ids.slice(0, 100))]
+    const docs = await Product.find({ _id: { $in: wanted } }).lean()
+    const byId = new Map(docs.map((doc) => [doc._id, doc]))
+    return res.json(wanted.filter((id) => byId.has(id)).map((id) => toProduct(byId.get(id))))
   }
 
   const collection = v.oneOf(req.query.collection ?? 'all', 'collection', COLLECTIONS)
@@ -170,26 +139,39 @@ productsRouter.get('/', async (req, res) => {
   const sort = v.oneOf(req.query.sort || 'featured', 'sort', SORTS)
   const limit = optionalInt(req.query.limit, 'limit', { min: 1, max: 200 }) ?? 200
 
-  const [facetRows, listRows] = await Promise.all([
-    query(FACETS_SQL, [collection, words]),
-    query(LIST_SQL, [
-      collection,
-      words,
-      typeof req.query.subcategory === 'string' && req.query.subcategory
-        ? req.query.subcategory
-        : null,
-      optionalInt(req.query.minPrice, 'minPrice'),
-      optionalInt(req.query.maxPrice, 'maxPrice'),
-      req.query.inStock === '1' || req.query.inStock === 'true',
-      list(req.query.sizes),
-      list(req.query.colours),
-      sort,
-      limit,
+  const base = baseFilter(collection, words)
+  const filter = { ...base }
+  const subcategory = req.query.subcategory
+  if (typeof subcategory === 'string' && subcategory) filter.subcategory = subcategory
+  const minPrice = optionalInt(req.query.minPrice, 'minPrice')
+  const maxPrice = optionalInt(req.query.maxPrice, 'maxPrice')
+  if (minPrice !== null || maxPrice !== null) {
+    filter.price = {
+      ...(minPrice !== null ? { $gte: minPrice } : {}),
+      ...(maxPrice !== null ? { $lte: maxPrice } : {}),
+    }
+  }
+  const colours = list(req.query.colours)
+  if (colours) filter['colours.name'] = { $in: colours }
+  const stockChecks = []
+  if (req.query.inStock === '1' || req.query.inStock === 'true') stockChecks.push(hasStockExpr())
+  const sizes = list(req.query.sizes)
+  if (sizes) stockChecks.push(hasStockExpr(sizes))
+  if (stockChecks.length) filter.$expr = { $and: stockChecks }
+
+  const [facetDocs, listDocs] = await Promise.all([
+    Product.find(base, { sizes: 1, colours: 1, subcategory: 1, price: 1 }).sort({ _id: 1 }).lean(),
+    Product.aggregate([
+      { $match: filter },
+      { $addFields: { isBestseller: { $in: ['bestseller', '$tags'] } } },
+      { $sort: SORT_STAGES[sort] },
+      { $limit: limit },
+      { $project: { isBestseller: 0 } },
     ]),
   ])
 
-  const items = listRows.rows.map(toProduct)
-  res.json({ items, total: items.length, facets: buildFacets(facetRows.rows) })
+  const items = listDocs.map(toProduct)
+  res.json({ items, total: items.length, facets: buildFacets(facetDocs) })
 })
 
 /** GET /api/products/search?q=&limit= → Product[] (search-overlay suggestions) */
@@ -197,20 +179,37 @@ productsRouter.get('/search', async (req, res) => {
   const words = searchWords(req.query.q)
   if (words.length === 0) return res.json([])
   const limit = optionalInt(req.query.limit, 'limit', { min: 1, max: 50 }) ?? 6
-  const { rows } = await query(SEARCH_SQL, ['all', words, limit])
-  res.json(rows.map(toProduct))
+  const docs = await Product.find(baseFilter('all', words)).sort({ _id: 1 }).limit(limit).lean()
+  res.json(docs.map(toProduct))
 })
 
-/** GET /api/products/:id/related?limit= → Product[] */
+/**
+ * GET /api/products/:id/related?limit= → Product[]
+ * Scores every other product (same subcategory +3, same category +2, a shared colour +1),
+ * then best score, best rating. The catalogue is small, so this is done in JS.
+ */
 productsRouter.get('/:id/related', async (req, res) => {
   const limit = optionalInt(req.query.limit, 'limit', { min: 1, max: 50 }) ?? 8
-  const { rows } = await query(RELATED_SQL, [req.params.id, limit])
-  res.json(rows.map(toProduct))
+  const target = await Product.findById(req.params.id).lean()
+  if (!target) return res.json([])
+
+  const targetColours = new Set(target.colours.map((colour) => colour.name))
+  const score = (p) =>
+    (p.category === target.category ? 2 : 0) +
+    (p.subcategory === target.subcategory ? 3 : 0) +
+    (p.colours.some((colour) => targetColours.has(colour.name)) ? 1 : 0)
+
+  const others = await Product.find({ _id: { $ne: target._id } }).lean()
+  const related = others
+    .map((p) => ({ p, score: score(p) }))
+    .sort((a, b) => b.score - a.score || b.p.rating - a.p.rating || (a.p._id < b.p._id ? -1 : 1))
+    .slice(0, limit)
+  res.json(related.map(({ p }) => toProduct(p)))
 })
 
 /** GET /api/products/:slug → Product (404 if missing) */
 productsRouter.get('/:slug', async (req, res) => {
-  const { rows } = await query('SELECT * FROM products WHERE slug = $1', [req.params.slug])
-  if (!rows[0]) throw new HttpError(404, 'Product not found')
-  res.json(toProduct(rows[0]))
+  const product = await Product.findOne({ slug: req.params.slug }).lean()
+  if (!product) throw new HttpError(404, 'Product not found')
+  res.json(toProduct(product))
 })

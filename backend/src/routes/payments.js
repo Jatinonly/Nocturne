@@ -2,11 +2,12 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { Router } from 'express'
 import Razorpay from 'razorpay'
 import { config } from '../config.js'
-import { withTransaction } from '../db/pool.js'
+import { withTransaction } from '../db/mongo.js'
 import { HttpError } from '../lib/httpError.js'
 import * as v from '../lib/validate.js'
 import { requireAuth } from '../middleware/auth.js'
-import { loadOrders } from './orders.js'
+import { Order, Product } from '../models/index.js'
+import { toOrder } from './orders.js'
 
 export const paymentsRouter = Router()
 
@@ -35,14 +36,14 @@ function paymentSignature(orderId, paymentId) {
     .digest('hex')
 }
 
-async function findOwnedOrder(db, orderId, userId, { lock = false } = {}) {
-  const { rows } = await db.query(
-    `SELECT * FROM orders WHERE id = $1 AND user_id = $2${lock ? ' FOR UPDATE' : ''}`,
-    [orderId, userId],
-  )
-  if (!rows[0]) throw new HttpError(404, 'Order not found')
-  return rows[0]
+async function findOwnedOrder(session, orderId, userId) {
+  const order = await Order.findOne({ _id: orderId, userId }).session(session).lean()
+  if (!order) throw new HttpError(404, 'Order not found')
+  return order
 }
+
+// Inside a transaction, any other request that writes the same order makes one of the two
+// transactions fail and retry, so these updates behave like the old `SELECT … FOR UPDATE`.
 
 /**
  * POST /api/payments/razorpay/webhook
@@ -73,21 +74,21 @@ paymentsRouter.post('/razorpay/webhook', async (req, res) => {
     const razorpayOrderId = payment?.order_id ?? event.payload?.order?.entity?.id
     const razorpayPaymentId = payment?.id ?? null
     if (typeof razorpayOrderId === 'string' && razorpayOrderId) {
-      await withTransaction(async (client) => {
-        const { rows } = await client.query(
-          'SELECT * FROM orders WHERE razorpay_order_id = $1 FOR UPDATE',
-          [razorpayOrderId],
-        )
-        const order = rows[0]
-        if (!order || order.payment_method !== 'razorpay' || order.payment_status === 'paid') return
-        await client.query(
-          `UPDATE orders
-           SET payment_status = 'paid', status = 'confirmed',
-               razorpay_payment_id = COALESCE($2, razorpay_payment_id)
-           WHERE id = $1`,
-          [order.id, razorpayPaymentId],
-        )
-      })
+      // Only flips an unpaid Razorpay order to paid; repeats of the same event change nothing.
+      await Order.updateOne(
+        {
+          'payment.razorpayOrderId': razorpayOrderId,
+          'payment.method': 'razorpay',
+          'payment.status': { $ne: 'paid' },
+        },
+        {
+          $set: {
+            'payment.status': 'paid',
+            status: 'confirmed',
+            ...(razorpayPaymentId ? { 'payment.razorpayPaymentId': razorpayPaymentId } : {}),
+          },
+        },
+      )
     }
   }
 
@@ -102,32 +103,33 @@ paymentsRouter.use(requireAuth)
  */
 paymentsRouter.post('/razorpay/order', async (req, res) => {
   const orderId = v.str(req.body?.orderId, 'Order')
-  const result = await withTransaction(async (client) => {
-    const order = await findOwnedOrder(client, orderId, req.userId, { lock: true })
-    if (order.payment_method !== 'razorpay') {
+  const result = await withTransaction(async (session) => {
+    const order = await findOwnedOrder(session, orderId, req.userId)
+    const { razorpayOrderId } = order.payment
+    if (order.payment.method !== 'razorpay') {
       throw new HttpError(400, 'This order is not payable with Razorpay')
     }
-    if (order.payment_status === 'paid') throw new HttpError(409, 'This order is already paid')
-    if (order.payment_status !== 'pending' || order.status === 'cancelled') {
+    if (order.payment.status === 'paid') throw new HttpError(409, 'This order is already paid')
+    if (order.payment.status !== 'pending' || order.status === 'cancelled') {
       throw new HttpError(409, 'This order can no longer be paid')
     }
 
-    const amount = Number(order.total) * 100
+    const amount = Number(order.summary.total) * 100
     if (!Number.isSafeInteger(amount) || amount <= 0) {
       throw new HttpError(400, 'Order total is not a valid payment amount')
     }
 
     if (config.razorpay.mock) {
-      const razorpayOrderId =
-        order.razorpay_order_id ?? `order_mock_${randomBytes(10).toString('hex')}`
-      if (!order.razorpay_order_id) {
-        await client.query('UPDATE orders SET razorpay_order_id = $2 WHERE id = $1', [
-          order.id,
-          razorpayOrderId,
-        ])
+      const mockOrderId = razorpayOrderId ?? `order_mock_${randomBytes(10).toString('hex')}`
+      if (!razorpayOrderId) {
+        await Order.updateOne(
+          { _id: order._id },
+          { $set: { 'payment.razorpayOrderId': mockOrderId } },
+          { session },
+        )
       }
       return {
-        id: razorpayOrderId,
+        id: mockOrderId,
         amount,
         currency: 'INR',
         keyId: 'mock',
@@ -135,13 +137,13 @@ paymentsRouter.post('/razorpay/order', async (req, res) => {
       }
     }
 
-    if (order.razorpay_order_id?.startsWith('order_mock_')) {
+    if (razorpayOrderId?.startsWith('order_mock_')) {
       throw new HttpError(409, 'This order was created in mock mode and cannot use live checkout')
     }
     const keyId = config.razorpay.keyId
-    if (order.razorpay_order_id) {
+    if (razorpayOrderId) {
       return {
-        id: order.razorpay_order_id,
+        id: razorpayOrderId,
         amount,
         currency: 'INR',
         keyId,
@@ -152,12 +154,13 @@ paymentsRouter.post('/razorpay/order', async (req, res) => {
     const gatewayOrder = await createRazorpayClient().orders.create({
       amount,
       currency: 'INR',
-      receipt: order.id,
+      receipt: order._id,
     })
-    await client.query('UPDATE orders SET razorpay_order_id = $2 WHERE id = $1', [
-      order.id,
-      gatewayOrder.id,
-    ])
+    await Order.updateOne(
+      { _id: order._id },
+      { $set: { 'payment.razorpayOrderId': gatewayOrder.id } },
+      { session },
+    )
     return {
       id: gatewayOrder.id,
       amount: gatewayOrder.amount,
@@ -189,35 +192,36 @@ paymentsRouter.post('/razorpay/verify', async (req, res) => {
     throw new HttpError(400, 'Payment signature is invalid')
   }
 
-  const result = await withTransaction(async (client) => {
-    const order = await findOwnedOrder(client, orderId, req.userId, { lock: true })
-    if (order.payment_method !== 'razorpay' || order.razorpay_order_id !== razorpayOrderId) {
+  const result = await withTransaction(async (session) => {
+    const order = await findOwnedOrder(session, orderId, req.userId)
+    const { payment } = order
+    if (payment.method !== 'razorpay' || payment.razorpayOrderId !== razorpayOrderId) {
       throw new HttpError(400, 'Payment does not match this order')
     }
-    if (order.payment_status === 'paid') {
-      if (order.razorpay_payment_id && order.razorpay_payment_id !== razorpayPaymentId) {
+    let update = null
+    if (payment.status === 'paid') {
+      if (payment.razorpayPaymentId && payment.razorpayPaymentId !== razorpayPaymentId) {
         throw new HttpError(409, 'This order has already been paid')
       }
-      if (!order.razorpay_payment_id) {
-        await client.query('UPDATE orders SET razorpay_payment_id = $2 WHERE id = $1', [
-          order.id,
-          razorpayPaymentId,
-        ])
-      }
+      if (!payment.razorpayPaymentId) update = { 'payment.razorpayPaymentId': razorpayPaymentId }
     } else {
-      if (order.payment_status !== 'pending' || order.status === 'cancelled') {
+      if (payment.status !== 'pending' || order.status === 'cancelled') {
         throw new HttpError(409, 'This order can no longer be paid')
       }
-      await client.query(
-        `UPDATE orders
-         SET payment_status = 'paid', status = 'confirmed', razorpay_payment_id = $2
-         WHERE id = $1`,
-        [order.id, razorpayPaymentId],
-      )
+      update = {
+        'payment.status': 'paid',
+        status: 'confirmed',
+        'payment.razorpayPaymentId': razorpayPaymentId,
+      }
     }
-    const { rows } = await client.query('SELECT * FROM orders WHERE id = $1', [order.id])
-    const [updatedOrder] = await loadOrders(rows, client)
-    return updatedOrder
+    const updatedOrder = update
+      ? await Order.findOneAndUpdate(
+          { _id: order._id },
+          { $set: update },
+          { session, returnDocument: 'after', lean: true },
+        )
+      : order
+    return toOrder(updatedOrder)
   })
 
   res.json({ verified: true, order: result })
@@ -229,36 +233,29 @@ paymentsRouter.post('/razorpay/verify', async (req, res) => {
  */
 paymentsRouter.post('/razorpay/fail', async (req, res) => {
   const orderId = v.str(req.body?.orderId, 'Order')
-  const result = await withTransaction(async (client) => {
-    const order = await findOwnedOrder(client, orderId, req.userId, { lock: true })
-    if (order.payment_method !== 'razorpay') {
+  const result = await withTransaction(async (session) => {
+    const order = await findOwnedOrder(session, orderId, req.userId)
+    if (order.payment.method !== 'razorpay') {
       throw new HttpError(400, 'This order is not payable with Razorpay')
     }
-    if (order.payment_status === 'paid') throw new HttpError(409, 'A paid order cannot be failed')
-    if (order.payment_status === 'failed') return { failed: true }
+    if (order.payment.status === 'paid') throw new HttpError(409, 'A paid order cannot be failed')
+    if (order.payment.status === 'failed') return { failed: true }
 
-    const { rows: lines } = await client.query(
-      `SELECT product_id, size, SUM(quantity)::int AS quantity
-       FROM order_items WHERE order_id = $1 GROUP BY product_id, size`,
-      [order.id],
+    // Mark the order failed first; the status filter makes sure stock is released only once.
+    const { modifiedCount } = await Order.updateOne(
+      { _id: order._id, 'payment.status': 'pending' },
+      { $set: { 'payment.status': 'failed', status: 'cancelled' } },
+      { session },
     )
-    for (const line of lines) {
-      await client.query(
-        `UPDATE products
-         SET stock = jsonb_set(
-           stock,
-           ARRAY[$2::text],
-           to_jsonb((stock ->> $2::text)::int + $3::int),
-           true
-         )
-         WHERE id = $1`,
-        [line.product_id, line.size, line.quantity],
+    if (modifiedCount === 0) return { failed: true }
+
+    for (const item of order.items) {
+      await Product.updateOne(
+        { _id: item.productId },
+        { $inc: { [`stock.${item.size}`]: item.quantity } },
+        { session },
       )
     }
-    await client.query(
-      `UPDATE orders SET payment_status = 'failed', status = 'cancelled' WHERE id = $1`,
-      [order.id],
-    )
     return { failed: true }
   })
 

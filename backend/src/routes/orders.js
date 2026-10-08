@@ -5,10 +5,11 @@
 import { randomBytes } from 'node:crypto'
 import { Router } from 'express'
 import { config } from '../config.js'
-import { query, withTransaction } from '../db/pool.js'
+import { withTransaction } from '../db/mongo.js'
 import { HttpError } from '../lib/httpError.js'
 import * as v from '../lib/validate.js'
 import { requireAuth } from '../middleware/auth.js'
+import { Order, Product } from '../models/index.js'
 
 export const ordersRouter = Router()
 ordersRouter.use(requireAuth)
@@ -16,97 +17,42 @@ ordersRouter.use(requireAuth)
 const MAX_LINES = 50
 const MAX_QUANTITY_PER_LINE = 20
 
-const LOCK_PRODUCTS_SQL = `
-  SELECT id, slug, name, price, compare_at_price, sizes, colours, stock, silhouette
-  FROM products WHERE id = ANY ($1::text[])
-  FOR UPDATE`
-
-const DECREMENT_STOCK_SQL = `
-  UPDATE products
-  SET stock = jsonb_set(stock, ARRAY[$2::text], to_jsonb((stock ->> $2::text)::int - $3::int))
-  WHERE id = $1`
-
-const INSERT_ORDER_SQL = `
-  INSERT INTO orders (
-    id, user_id, status,
-    ship_full_name, ship_phone, ship_email, ship_line1, ship_line2, ship_city, ship_state, ship_pincode,
-    item_count, mrp_total, subtotal, savings, shipping, total,
-    payment_method, payment_status
-  ) VALUES ($1, $2, 'placed', $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'pending')`
-
-const INSERT_ITEM_SQL = `
-  INSERT INTO order_items (
-    order_id, product_id, slug, name, price, compare_at_price,
-    size, colour_name, colour_hex, silhouette, quantity
-  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`
-
-const LIST_ORDERS_SQL = 'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC'
-const GET_ORDER_SQL = 'SELECT * FROM orders WHERE id = $1 AND user_id = $2'
-const ITEMS_FOR_ORDERS_SQL =
-  'SELECT * FROM order_items WHERE order_id = ANY ($1::text[]) ORDER BY id'
-
 function newOrderId() {
   const time = Date.now().toString(36).slice(-4).toUpperCase()
   const random = randomBytes(4).toString('hex').toUpperCase()
   return `NOC-${time}${random}`
 }
 
-/** Row(s) → the `Order` shape the frontend uses (see frontend/src/services/orderService.js). */
-export function toOrder(row, itemRows) {
+/** Order document → the `Order` shape the frontend uses (see frontend/src/services/orderService.js). */
+export function toOrder(doc) {
+  const { razorpayOrderId, razorpayPaymentId } = doc.payment
   return {
-    id: row.id,
-    userId: row.user_id,
-    status: row.status,
-    createdAt: row.created_at.toISOString(),
-    address: {
-      fullName: row.ship_full_name,
-      phone: row.ship_phone,
-      email: row.ship_email,
-      line1: row.ship_line1,
-      line2: row.ship_line2,
-      city: row.ship_city,
-      state: row.ship_state,
-      pincode: row.ship_pincode,
-    },
-    summary: {
-      itemCount: row.item_count,
-      mrpTotal: row.mrp_total,
-      subtotal: row.subtotal,
-      savings: row.savings,
-      shipping: row.shipping,
-      total: row.total,
-    },
+    id: doc._id,
+    userId: doc.userId.toString(),
+    status: doc.status,
+    createdAt: doc.createdAt.toISOString(),
+    address: { ...doc.address },
+    summary: { ...doc.summary },
     payment: {
-      method: row.payment_method,
-      status: row.payment_status,
-      ...(row.razorpay_order_id ? { razorpayOrderId: row.razorpay_order_id } : {}),
-      ...(row.razorpay_payment_id ? { razorpayPaymentId: row.razorpay_payment_id } : {}),
+      method: doc.payment.method,
+      status: doc.payment.status,
+      ...(razorpayOrderId ? { razorpayOrderId } : {}),
+      ...(razorpayPaymentId ? { razorpayPaymentId } : {}),
     },
-    items: itemRows.map((item) => ({
-      id: `${item.product_id}:${item.size}:${item.colour_name}`,
-      productId: item.product_id,
+    items: doc.items.map((item) => ({
+      id: `${item.productId}:${item.size}:${item.colour.name}`,
+      productId: item.productId,
       slug: item.slug,
       name: item.name,
       price: item.price,
-      ...(item.compare_at_price !== null ? { compareAtPrice: item.compare_at_price } : {}),
+      ...(item.compareAtPrice != null ? { compareAtPrice: item.compareAtPrice } : {}),
       size: item.size,
-      colour: { name: item.colour_name, hex: item.colour_hex },
+      colour: { name: item.colour.name, hex: item.colour.hex },
       silhouette: item.silhouette,
       quantity: item.quantity,
       maxQuantity: item.quantity,
     })),
   }
-}
-
-export async function loadOrders(orderRows, db = { query }) {
-  if (orderRows.length === 0) return []
-  const { rows: itemRows } = await db.query(ITEMS_FOR_ORDERS_SQL, [orderRows.map((row) => row.id)])
-  return orderRows.map((row) =>
-    toOrder(
-      row,
-      itemRows.filter((item) => item.order_id === row.id),
-    ),
-  )
 }
 
 function parseAddress(input) {
@@ -145,10 +91,12 @@ ordersRouter.post('/', async (req, res) => {
   const address = parseAddress(req.body?.address)
   const method = v.oneOf(req.body?.payment?.method, 'Payment method', ['cod', 'razorpay'])
 
-  const order = await withTransaction(async (client) => {
+  const order = await withTransaction(async (session) => {
     const productIds = [...new Set(items.map((item) => item.productId))]
-    const { rows: products } = await client.query(LOCK_PRODUCTS_SQL, [productIds])
-    const byId = new Map(products.map((product) => [product.id, product]))
+    const products = await Product.find({ _id: { $in: productIds } })
+      .session(session)
+      .lean()
+    const byId = new Map(products.map((product) => [product._id, product]))
 
     // Stock is tracked per size (not per colour), so add up lines that share a product + size.
     const wanted = new Map()
@@ -161,7 +109,7 @@ ordersRouter.post('/', async (req, res) => {
       const colour = product.colours.find((c) => c.name === item.colourName)
       if (!colour)
         throw new HttpError(400, `${product.name} is not available in ${item.colourName}`)
-      const key = `${product.id}|${item.size}`
+      const key = `${product._id}|${item.size}`
       wanted.set(key, (wanted.get(key) ?? 0) + item.quantity)
       return { product, colour, size: item.size, quantity: item.quantity }
     })
@@ -170,64 +118,62 @@ ordersRouter.post('/', async (req, res) => {
       const [productId, size] = key.split('|')
       const product = byId.get(productId)
       const available = Number(product.stock[size] ?? 0)
-      if (available < quantity) {
-        throw new HttpError(
+      const soldOut = () =>
+        new HttpError(
           409,
           available === 0
             ? `${product.name} (${size}) has just sold out`
             : `Only ${available} left of ${product.name} (${size})`,
         )
-      }
-      await client.query(DECREMENT_STOCK_SQL, [productId, size, quantity])
+      if (available < quantity) throw soldOut()
+      // Only decrements if there is still enough stock, so concurrent orders can't oversell.
+      const { modifiedCount } = await Product.updateOne(
+        { _id: productId, [`stock.${size}`]: { $gte: quantity } },
+        { $inc: { [`stock.${size}`]: -quantity } },
+        { session },
+      )
+      if (modifiedCount === 0) throw soldOut()
     }
 
     const itemCount = lines.reduce((sum, line) => sum + line.quantity, 0)
     const subtotal = lines.reduce((sum, line) => sum + line.product.price * line.quantity, 0)
     const mrpTotal = lines.reduce(
-      (sum, line) => sum + (line.product.compare_at_price ?? line.product.price) * line.quantity,
+      (sum, line) => sum + (line.product.compareAtPrice ?? line.product.price) * line.quantity,
       0,
     )
     const shipping = subtotal >= config.shipping.freeThreshold ? 0 : config.shipping.fee
 
-    const id = newOrderId()
-    await client.query(INSERT_ORDER_SQL, [
-      id,
-      req.userId,
-      address.fullName,
-      address.phone,
-      address.email,
-      address.line1,
-      address.line2,
-      address.city,
-      address.state,
-      address.pincode,
-      itemCount,
-      mrpTotal,
-      subtotal,
-      mrpTotal - subtotal,
-      shipping,
-      subtotal + shipping,
-      method,
-    ])
-    for (const line of lines) {
-      await client.query(INSERT_ITEM_SQL, [
-        id,
-        line.product.id,
-        line.product.slug,
-        line.product.name,
-        line.product.price,
-        line.product.compare_at_price,
-        line.size,
-        line.colour.name,
-        line.colour.hex,
-        line.product.silhouette,
-        line.quantity,
-      ])
-    }
-
-    const { rows } = await client.query(GET_ORDER_SQL, [id, req.userId])
-    const [created] = await loadOrders(rows, client)
-    return created
+    const [created] = await Order.create(
+      [
+        {
+          _id: newOrderId(),
+          userId: req.userId,
+          address,
+          summary: {
+            itemCount,
+            mrpTotal,
+            subtotal,
+            savings: mrpTotal - subtotal,
+            shipping,
+            total: subtotal + shipping,
+          },
+          payment: { method },
+          items: lines.map((line) => ({
+            productId: line.product._id,
+            slug: line.product.slug,
+            name: line.product.name,
+            price: line.product.price,
+            compareAtPrice: line.product.compareAtPrice ?? null,
+            size: line.size,
+            colour: { name: line.colour.name, hex: line.colour.hex },
+            silhouette: line.product.silhouette,
+            quantity: line.quantity,
+          })),
+        },
+      ],
+      { session },
+    )
+    return toOrder(created.toObject())
   })
 
   res.status(201).json(order)
@@ -235,14 +181,13 @@ ordersRouter.post('/', async (req, res) => {
 
 /** GET /api/orders → Order[] (newest first) */
 ordersRouter.get('/', async (req, res) => {
-  const { rows } = await query(LIST_ORDERS_SQL, [req.userId])
-  res.json(await loadOrders(rows))
+  const orders = await Order.find({ userId: req.userId }).sort({ createdAt: -1 }).lean()
+  res.json(orders.map(toOrder))
 })
 
 /** GET /api/orders/:id → Order */
 ordersRouter.get('/:id', async (req, res) => {
-  const { rows } = await query(GET_ORDER_SQL, [req.params.id, req.userId])
-  if (!rows[0]) throw new HttpError(404, 'Order not found')
-  const [order] = await loadOrders(rows)
-  res.json(order)
+  const order = await Order.findOne({ _id: req.params.id, userId: req.userId }).lean()
+  if (!order) throw new HttpError(404, 'Order not found')
+  res.json(toOrder(order))
 })
