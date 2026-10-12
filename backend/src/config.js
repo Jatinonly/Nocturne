@@ -38,7 +38,7 @@ export const config = {
     expiresIn: process.env.JWT_EXPIRES_IN ?? '7d',
   },
   razorpay: {
-    mock: (process.env.RAZORPAY_MOCK ?? 'false').toLowerCase() === 'true',
+    mock: (process.env.RAZORPAY_MOCK ?? 'true').toLowerCase() === 'true',
     get keyId() {
       return required('RAZORPAY_KEY_ID')
     },

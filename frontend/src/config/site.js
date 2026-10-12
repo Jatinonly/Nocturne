@@ -69,8 +69,8 @@ export const site = {
       title: 'Follow us',
       links: [
         { label: 'Instagram', to: 'https://instagram.com' },
-        { label: 'Pinterest', to: 'https://pinterest.com' },
-        { label: 'YouTube', to: 'https://youtube.com' },
+        { label: 'GitHub', to: 'https://github.com/Jatinonly' },
+        { label: 'LinkedIn', to: 'https://www.linkedin.com/in/jatin-kumar-9697a728b' },
       ],
     },
   ],

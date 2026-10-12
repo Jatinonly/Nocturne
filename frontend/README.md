@@ -148,15 +148,13 @@ The backend re-prices the cart and checks stock when creating an order; totals s
 
 ---
 
-## Enabling real Razorpay
+## Simulated Razorpay
 
-With a non-empty `VITE_API_BASE_URL`, the backend controls which checkout is used. Set `RAZORPAY_MOCK=true` in `backend/.env` to use the simulated popup while still testing API order creation and stock reservation; no Razorpay keys are needed in this mode. Set `RAZORPAY_MOCK=false` and configure `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and `RAZORPAY_WEBHOOK_SECRET` in `backend/.env` for real Razorpay test-mode checkout. The key secret and webhook secret must never be placed in frontend environment variables. Restart the backend after changing these values.
+Checkout always uses the simulated popup; no Razorpay keys or hosted checkout script are needed. When `VITE_API_BASE_URL` is non-empty, set `RAZORPAY_MOCK=true` in `backend/.env` so mock payments update the database order and release reserved stock on failure. This is the default. The backend also contains server-side code for a live gateway, but the frontend does not invoke live checkout.
 
-Checkout first creates a pending order through `POST /orders`, which prices the cart and reserves stock. It then sends only that database order id to `POST /payments/razorpay/order`; the backend creates the gateway order from its stored total and returns its key id. After checkout, the frontend sends the signature and both Razorpay ids to `POST /payments/razorpay/verify`. A failed or dismissed checkout is reported to `POST /payments/razorpay/fail`, which marks the order cancelled and restores stock.
+Checkout first creates a pending order through `POST /orders`, which prices the cart and reserves stock. It then sends only that database order id to `POST /payments/razorpay/order`; the backend creates a mock payment order from the stored total. The simulated popup returns mock identifiers and a signature, which the backend verifies through `POST /payments/razorpay/verify`. A failed or dismissed checkout is reported to `POST /payments/razorpay/fail`, which marks the order cancelled and restores stock.
 
-Configure the Razorpay webhook URL as `/api/payments/razorpay/webhook` and subscribe to `payment.captured` and `order.paid`. The webhook signature is verified against the exact raw request body so an order is still marked paid if the customer closes the page before verification completes.
-
-Cash on delivery continues to create an order with payment pending and order status placed. No `RAZORPAY_MOCK` variable is needed in `frontend/.env`: the backend includes a mock flag in its payment-order response, and the frontend uses it to choose the simulated popup. Mock checkout also remains available when `VITE_API_BASE_URL` is empty.
+Cash on delivery continues to create an order with payment pending and order status placed. No Razorpay key or payment-specific variable is needed in `frontend/.env`. Mock checkout also works with `VITE_API_BASE_URL` empty, in which case orders and payment results are stored in browser localStorage instead of the database.
 
 ---
 
